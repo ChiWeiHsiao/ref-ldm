@@ -3,10 +3,13 @@ import torch.nn as nn
 from functools import partial
 import clip
 from einops import rearrange, repeat
+from typing import List
 import kornia
 
 
 from ldm.modules.x_transformer import Encoder, TransformerWrapper  # TODO: can we directly rely on lucidrains code and simply add this as a reuirement? --> test
+from ldm.util import instantiate_from_config
+from ldm.util import freeze_model
 
 
 class AbstractEncoder(nn.Module):
@@ -200,3 +203,102 @@ class FrozenClipImageEmbedder(nn.Module):
         # x is assumed to be in range [-1,1]
         return self.model.encode_image(self.preprocess(x))
 
+
+class ResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1):
+        super(ResBlock, self).__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch)
+        )
+        if stride != 1 or in_ch != out_ch:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch)
+            )
+        else:
+            self.shortcut = nn.Identity()
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        out = self.layers(x)
+        out = out + self.shortcut(x)
+        out = self.relu(out)
+        return out
+
+
+class PartialFrozenReferenceImageEncoder(nn.Module):
+    def __init__(self, frozen_encoder, in_ch: int, out_ch: List[int]):
+        super().__init__()
+        self.frozen_encoder = instantiate_from_config(frozen_encoder)
+        freeze_model(self.frozen_encoder)
+
+        layers = []
+        layers.append(ResBlock(in_ch, out_ch[0], stride=1))
+        n_downsample = len(out_ch) - 1
+        for i in range(n_downsample):
+            layers.append(ResBlock(out_ch[i], out_ch[i + 1], stride=2))
+        self.trainable_layers = nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.frozen_encoder.encode(x)
+        x = self.trainable_layers(x)
+        x = rearrange(x, 'b c h w -> b (h w) c')  # will be context in cross-attention
+        return x
+
+
+class ReferenceImagesEncoderConv(nn.Module):
+    def __init__(self, frozen_encoder, in_ch: int, out_ch: List[int], semantic_num_class=None, semantic_ch=4):
+        super().__init__()
+        self.frozen_encoder = instantiate_from_config(frozen_encoder)
+        freeze_model(self.frozen_encoder)
+
+        if semantic_num_class is not None:
+            self.semantic_embedding = nn.Embedding(semantic_num_class, semantic_ch)
+            in_ch = in_ch + semantic_ch
+        else:
+            self.semantic_embedding = None
+
+        layers = []
+        layers.append(ResBlock(in_ch, out_ch[0], stride=1))
+        n_downsample = len(out_ch) - 1
+        for i in range(n_downsample):
+            layers.append(ResBlock(out_ch[i], out_ch[i + 1], stride=2))
+        self.trainable_layers = nn.Sequential(*layers)
+
+
+    def forward(self, x):
+        '''
+        Input:
+            [B, C, H, (Nref * W)]
+        Return:
+            [B, Ntoken, C']
+            where Ntoken = (H * Nref * W)
+        '''
+        if self.semantic_embedding is not None:
+            x, sem = x[:, :3], x[:, 3]
+            sem = self.semantic_embedding(sem.long())
+            sem = rearrange(sem, 'b h w c -> b c h w')
+        x = self.frozen_encoder.encode(x)
+        if self.semantic_embedding is not None:
+            sem = nn.functional.adaptive_avg_pool2d(sem, x.shape[2:])
+            x = torch.cat([x, sem], dim=1)
+        x = self.trainable_layers(x)
+        x = rearrange(x, 'b c h w -> b (h w) c')
+        return x
+
+
+class ReferenceImagesEncoderPatchify(nn.Module):
+    def __init__(self, frozen_encoder, patchify_size=1):
+        super().__init__()
+        self.frozen_encoder = instantiate_from_config(frozen_encoder)
+        freeze_model(self.frozen_encoder)
+        self.patchify_size = patchify_size
+
+    def forward(self, x):
+        e = self.frozen_encoder.encode(x)
+        e = rearrange(e, 'b c (h ph) (w pw) -> b (h w) (ph pw c)', ph=self.patchify_size, pw=self.patchify_size)
+        return e

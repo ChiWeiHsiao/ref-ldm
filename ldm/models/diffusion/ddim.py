@@ -6,14 +6,16 @@ from tqdm import tqdm
 from functools import partial
 
 from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like
+from ldm import cache_kv
 
 
 class DDIMSampler(object):
-    def __init__(self, model, schedule="linear", **kwargs):
+    def __init__(self, model, schedule="uniform", print_tqdm=False, **kwargs):
         super().__init__()
         self.model = model
         self.ddpm_num_timesteps = model.num_timesteps
         self.schedule = schedule
+        self.print_tqdm = print_tqdm
 
     def register_buffer(self, name, attr):
         if type(attr) == torch.Tensor:
@@ -21,8 +23,8 @@ class DDIMSampler(object):
                 attr = attr.to(torch.device("cuda"))
         setattr(self, name, attr)
 
-    def make_schedule(self, ddim_num_steps, ddim_discretize="uniform", ddim_eta=0., verbose=True):
-        self.ddim_timesteps = make_ddim_timesteps(ddim_discr_method=ddim_discretize, num_ddim_timesteps=ddim_num_steps,
+    def make_schedule(self, ddim_num_steps, ddim_eta=0., verbose=True):
+        self.ddim_timesteps = make_ddim_timesteps(ddim_discr_method=self.schedule, num_ddim_timesteps=ddim_num_steps,
                                                   num_ddpm_timesteps=self.ddpm_num_timesteps,verbose=verbose)
         alphas_cumprod = self.model.alphas_cumprod
         assert alphas_cumprod.shape[0] == self.ddpm_num_timesteps, 'alphas have to be defined for each timestep'
@@ -77,9 +79,13 @@ class DDIMSampler(object):
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                **kwargs
                ):
+        '''
+        Args:
+            conditioning: condition(s) after condition model, can be a single tensor or a dict of tensors, ex. {'LR_image': tensor, }
+        '''
         if conditioning is not None:
             if isinstance(conditioning, dict):
-                cbs = conditioning[list(conditioning.keys())[0]].shape[0]
+                cbs = list(conditioning.values())[0].shape[0]
                 if cbs != batch_size:
                     print(f"Warning: Got {cbs} conditionings but batch-size is {batch_size}")
             else:
@@ -133,8 +139,12 @@ class DDIMSampler(object):
         time_range = reversed(range(0,timesteps)) if ddim_use_original_steps else np.flip(timesteps)
         total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
         print(f"Running DDIM Sampling with {total_steps} timesteps")
+        print('DDIM timesteps: ', timesteps)  # debug
 
-        iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
+        if self.print_tqdm:
+            iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
+        else:
+            iterator = time_range
 
         for i, step in enumerate(iterator):
             index = total_steps - i - 1
@@ -144,6 +154,12 @@ class DDIMSampler(object):
                 assert x0 is not None
                 img_orig = self.model.q_sample(x0, ts)  # TODO: deterministic forward pass?
                 img = img_orig * mask + (1. - mask) * img
+
+            if self.model.use_cache_kv:
+                if i == 0:
+                    cache_kv.mode = 'save'
+                else:
+                    cache_kv.mode = 'use'
 
             outs = self.p_sample_ddim(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps,
                                       quantize_denoised=quantize_denoised, temperature=temperature,
@@ -172,7 +188,10 @@ class DDIMSampler(object):
         else:
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
-            c_in = torch.cat([unconditional_conditioning, c])
+            if isinstance(c, dict):
+                c_in = {k: torch.cat([unconditional_conditioning[k], c[k]]) for k in c.keys()}
+            else:
+                c_in = torch.cat([unconditional_conditioning, c])
             e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
             e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
 

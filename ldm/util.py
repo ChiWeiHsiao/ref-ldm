@@ -5,6 +5,7 @@ import numpy as np
 from collections import abc
 from einops import rearrange
 from functools import partial
+from omegaconf import OmegaConf
 
 import multiprocessing as mp
 from threading import Thread
@@ -12,6 +13,20 @@ from queue import Queue
 
 from inspect import isfunction
 from PIL import Image, ImageDraw, ImageFont
+
+
+def disabled_train(self, mode=True):
+    """Overwrite model.train with this function to make sure train/eval mode
+    does not change anymore."""
+    return self
+
+
+def freeze_model(model: torch.nn.Module):
+    model.eval()
+    model.train = disabled_train
+    for param in model.parameters():
+        param.requires_grad = False
+    return model
 
 
 def log_txt_as_img(wh, xc, size=10):
@@ -76,6 +91,8 @@ def count_params(model, verbose=False):
 
 
 def instantiate_from_config(config):
+    if OmegaConf.is_config(config):
+        config = OmegaConf.to_object(config)  # convert to plain Python Dict / List
     if not "target" in config:
         if config == '__is_first_stage__':
             return None

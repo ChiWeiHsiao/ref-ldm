@@ -3,10 +3,12 @@ from functools import partial
 import math
 from typing import Iterable
 
+import torch
 import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 from ldm.modules.diffusionmodules.util import (
     checkpoint,
@@ -18,6 +20,7 @@ from ldm.modules.diffusionmodules.util import (
     timestep_embedding,
 )
 from ldm.modules.attention import SpatialTransformer
+from ldm import cache_kv
 
 
 # dummy replace
@@ -82,6 +85,8 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
             elif isinstance(layer, SpatialTransformer):
+                x = layer(x, context)
+            elif isinstance(layer, SpatialTransformerV1):
                 x = layer(x, context)
             else:
                 x = layer(x)
@@ -324,6 +329,78 @@ class AttentionBlock(nn.Module):
         return (x + h).reshape(b, c, *spatial)
 
 
+class SpatialTransformerV1(nn.Module):
+    '''
+    copy from class AttentionBlock
+    add a cross-attention layer for context
+    '''
+    def __init__(
+        self,
+        channels,
+        num_heads=1,
+        num_head_channels=-1,
+        use_checkpoint=False,
+        use_new_attention_order=False,
+        context_dim=None,
+        use_context=False,
+        **kwargs,
+    ):
+        super().__init__()
+        self.channels = channels
+        if num_head_channels == -1:
+            self.num_heads = num_heads
+        else:
+            assert (
+                channels % num_head_channels == 0
+            ), f"q,k,v channels {channels} is not divisible by num_head_channels {num_head_channels}"
+            self.num_heads = channels // num_head_channels
+        self.use_checkpoint = use_checkpoint
+        self.norm = normalization(channels)
+        self.qkv = conv_nd(1, channels, channels * 3, 1)
+        if use_new_attention_order:
+            # split qkv before split heads
+            self.attention = QKVAttention(self.num_heads)
+        else:
+            # split heads before split qkv
+            self.attention = QKVAttentionLegacy(self.num_heads)
+        self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
+
+        # additional layers for cross attention with context
+        self.use_context = use_context
+        if self.use_context:
+            self.crossattn_norm = normalization(channels)
+            self.crossattn_attention = nn.MultiheadAttention(
+                embed_dim=channels,
+                kdim=context_dim,
+                vdim=context_dim,
+                num_heads=num_heads,
+                batch_first=True,
+            )
+            self.crossattn_proj_out = zero_module(conv_nd(1, channels, channels, 1))
+
+    def forward(self, x, context=None):
+        '''
+        x: [B, C, H, W]
+        context: [B, Ntok, C]
+        '''
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        # self-attention
+        qkv = self.qkv(self.norm(x))
+        x_sa = self.attention(qkv)
+        x_sa = self.proj_out(x_sa)
+        x = x + x_sa
+        # cross-attention
+        if self.use_context:
+            x_ca = self.crossattn_norm(x)
+            x_ca, _ = self.crossattn_attention(query=x_ca.permute(0, 2, 1), key=context, value=context, need_weights=False)
+            x_ca = x_ca.permute(0, 2, 1)  # [B, C, Ntoken]
+            x_ca = self.crossattn_proj_out(x_ca)
+            x = x + x_ca
+        x = x.reshape(b, c, *spatial)
+        return x
+
+
 def count_flops_attn(model, _x, y):
     """
     A counter for the `thop` package to count the operations in an
@@ -364,6 +441,15 @@ class QKVAttentionLegacy(nn.Module):
         ch = width // (3 * self.n_heads)
         q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
         scale = 1 / math.sqrt(math.sqrt(ch))
+
+        if cache_kv.mode == 'save':
+            cache_kv.k[id(self)].append(k)
+            cache_kv.v[id(self)].append(v)
+        elif cache_kv.mode == 'use':
+            kc_lst = cache_kv.k[id(self)]
+            vc_lst = cache_kv.v[id(self)]
+            k = th.cat([k] + kc_lst, -1)
+            v = th.cat([v] + vc_lst, -1)
         weight = th.einsum(
             "bct,bcs->bts", q * scale, k * scale
         )  # More stable with f16 than dividing afterwards
@@ -453,6 +539,7 @@ class UNetModel(nn.Module):
         conv_resample=True,
         dims=2,
         num_classes=None,
+        use_ref_emb=False,
         use_checkpoint=False,
         use_fp16=False,
         num_heads=-1,
@@ -465,11 +552,17 @@ class UNetModel(nn.Module):
         transformer_depth=1,              # custom transformer support
         context_dim=None,                 # custom transformer support
         n_embed=None,                     # custom support for prediction of discrete ids into codebook of first stage vq model
+        spatial_transformer_classname='SpatialTransformer',
+        spatial_transformer_kwargs={},
+        cross_attention_resolutions=None,
         legacy=True,
     ):
         super().__init__()
         if use_spatial_transformer:
-            assert context_dim is not None, 'Fool!! You forgot to include the dimension of your cross-attention conditioning...'
+            #  assert context_dim is not None, 'Fool!! You forgot to include the dimension of your cross-attention conditioning...'
+            spatial_transformer_class = globals()[spatial_transformer_classname]
+        if cross_attention_resolutions is None:
+            cross_attention_resolutions = attention_resolutions
 
         if context_dim is not None:
             assert use_spatial_transformer, 'Fool!! You forgot to use the spatial transformer for your cross-attention conditioning...'
@@ -512,7 +605,10 @@ class UNetModel(nn.Module):
 
         if self.num_classes is not None:
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
-
+        if use_ref_emb:
+            self.ref_emb = nn.parameter.Parameter(torch.zeros(1, time_embed_dim))
+        else:
+            self.ref_emb = None
         self.input_blocks = nn.ModuleList(
             [
                 TimestepEmbedSequential(
@@ -554,8 +650,14 @@ class UNetModel(nn.Module):
                             num_heads=num_heads,
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
-                        ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                        ) if not use_spatial_transformer else spatial_transformer_class(
+                            ch,
+                            num_heads,
+                            dim_head,
+                            depth=transformer_depth,
+                            context_dim=context_dim,
+                            use_context=ds in cross_attention_resolutions,
+                            **spatial_transformer_kwargs,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -609,9 +711,15 @@ class UNetModel(nn.Module):
                 num_heads=num_heads,
                 num_head_channels=dim_head,
                 use_new_attention_order=use_new_attention_order,
-            ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
-                        ),
+            ) if not use_spatial_transformer else spatial_transformer_class(
+                ch,
+                num_heads,
+                dim_head,
+                depth=transformer_depth,
+                context_dim=context_dim,
+                use_context=ds in cross_attention_resolutions,
+                **spatial_transformer_kwargs,
+            ),
             ResBlock(
                 ch,
                 time_embed_dim,
@@ -655,8 +763,14 @@ class UNetModel(nn.Module):
                             num_heads=num_heads_upsample,
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
-                        ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                        ) if not use_spatial_transformer else spatial_transformer_class(
+                            ch,
+                            num_heads,
+                            dim_head,
+                            depth=transformer_depth,
+                            context_dim=context_dim,
+                            use_context=ds in cross_attention_resolutions,
+                            **spatial_transformer_kwargs,
                         )
                     )
                 if level and i == num_res_blocks:
@@ -707,7 +821,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps=None, context=None, y=None,**kwargs):
+    def forward(self, x, timesteps=None, context=None, y=None, is_ref=False, **kwargs):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -726,6 +840,9 @@ class UNetModel(nn.Module):
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
+
+        if is_ref and self.ref_emb is not None:
+            emb = self.ref_emb
 
         h = x.type(self.dtype)
         for module in self.input_blocks:
