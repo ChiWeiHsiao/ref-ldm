@@ -5,11 +5,10 @@
 
 🚩 **Updates**
 - [x] Release [FFHQ-Ref Dataset](#ffhq-ref-dataset)
+- [x] Release [ReF-LDM model](#model-inference) and inference script
 
-
-🚩 **TODO**
-- [ ] Release [ReF-LDM model](#ref-ldm-model)
-- [ ] Clean inference script
+📌 **TODO**
+- [ ] inference script for testing datasets
 
 <br>
 
@@ -22,19 +21,25 @@ ReF-LDM leverages **a flexible number of reference images** to restore a low-qua
 
 <img src="assets/visual_results.png" width="100%" alt="ReF-LDM results">
 
-### Model Architecture
+### Architecture
 
 <img src="assets/model.png" width="80%" alt="ReF-LDM architecture">
 
-### Inference Instructions
-TODO
+### Model Inference
+- 👉 [Download model](https://github.com/ChiWeiHsiao/ref-ldm/releases/tag/1.0.0)
+
+- Place model weights `refldm.ckpt` and `vqgan.ckpt` under `ckpts/`
+- Run `inference.py`
+  ```bash
+  python inference.py --ddim_step 50 --output_path result.png --lq_path assets/demo/lq.png --ref_paths assets/demo/ref0.png assets/demo/ref1.png assets/demo/ref2.png assets/demo/ref3.png
+  ```
 
 <br>
 
 
 ## FFHQ-Ref Dataset
 
-👉 [Download](https://github.com/ChiWeiHsiao/ref-ldm/releases/tag/0.1.0)
+👉 [Download data](https://github.com/ChiWeiHsiao/ref-ldm/releases/tag/0.1.0)
 
 ```
 FFHQ-Ref/
