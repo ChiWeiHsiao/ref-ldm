@@ -5,7 +5,7 @@ model:
     warmup_steps: 10000
   target: ldm.models.diffusion.ddpm.LatentDiffusion
   params:
-    ckpt_path: ./ckpts/ldm-bfr/model.ckpt
+    ckpt_path: ./ckpts/ldm.ckpt
     ignore_keys:
     - model_ema
     monitor: val/ddim_latent_l1_loss_ema
@@ -21,7 +21,7 @@ model:
     first_stage_config:
       target: ldm.models.autoencoder.VQModelInterface
       params:
-        ckpt_path: ./ckpts/vqgan/model.ckpt
+        ckpt_path: ./ckpts/vqgan.ckpt
         embed_dim: 8
         n_embed: 8192
         monitor: val/rec_loss
@@ -97,7 +97,7 @@ data:
         ref_rand_aug: true
         shuffle_refs_prob: 1.0
         use_sample_weight: false
-        file_list: data/ffhq/file_list/train_references_arcface0-04.csv
+        file_list: data/ffhq/file_list/train_references.csv
         gt_dir: data/ffhq/images512x512
         ref_dir: data/ffhq/images512x512
         image_size:
