@@ -73,16 +73,16 @@ model:
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 40
-    num_workers: 40
+    batch_size: 5
+    num_workers: 10
     wrap: false
     train:
       target: ldm.data.ir.ImageRestorationDataset
       params:
         use_given_lq: false
         use_given_ref: false
-        file_list: data/ffhq/file_list/train.csv
-        gt_dir: data/ffhq/images512x512
+        file_list: ./data/ffhq/file_list/train.csv
+        gt_dir: ./data/ffhq/images512x512
         image_size:
         - 512
         - 512

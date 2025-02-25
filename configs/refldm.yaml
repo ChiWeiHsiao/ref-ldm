@@ -85,7 +85,7 @@ model:
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 8
+    batch_size: 1
     num_workers: 8
     wrap: false
     train:
@@ -97,9 +97,9 @@ data:
         ref_rand_aug: true
         shuffle_refs_prob: 1.0
         use_sample_weight: false
-        file_list: data/ffhq/file_list/train_references.csv
-        gt_dir: data/ffhq/images512x512
-        ref_dir: data/ffhq/images512x512
+        file_list: ./data/ffhq/file_list/train_references.csv
+        gt_dir: ./data/ffhq/images512x512
+        ref_dir: ./data/ffhq/images512x512
         image_size:
         - 512
         - 512
